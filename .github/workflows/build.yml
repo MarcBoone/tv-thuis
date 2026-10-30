@@ -65,14 +65,24 @@ jobs:
                   applicationId 'nl.marc.tvhome'
                   minSdk 23
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '1.1'
+              }
+
+              // Vaste sleutel, zodat een nieuwe versie gewoon over de oude heen installeert.
+              signingConfigs {
+                  thuis {
+                      storeFile file('thuis.keystore')
+                      storePassword 'tvthuis'
+                      keyAlias 'tvthuis'
+                      keyPassword 'tvthuis'
+                  }
               }
 
               buildTypes {
                   release {
                       minifyEnabled false
-                      signingConfig signingConfigs.debug
+                      signingConfig signingConfigs.thuis
                   }
               }
 
@@ -131,16 +141,211 @@ jobs:
                           <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <activity
+                      android:name=".AllAppsActivity"
+                      android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|screenLayout|smallestScreenSize|uiMode|density"
+                      android:excludeFromRecents="true"
+                      android:exported="false"
+                      android:screenOrientation="landscape" />
               </application>
           </manifest>
           TVTHUIS_EOF
           mkdir -p app/src/main/java/nl/marc/tvhome
-          cat > app/src/main/java/nl/marc/tvhome/MainActivity.java <<'TVTHUIS_EOF'
+          cat > app/src/main/java/nl/marc/tvhome/AllAppsActivity.java <<'TVTHUIS_EOF'
           package nl.marc.tvhome;
 
           import android.app.Activity;
-          import android.app.AlertDialog;
-          import android.content.ActivityNotFoundException;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.util.TypedValue;
+          import android.view.KeyEvent;
+          import android.view.View;
+          import android.widget.GridLayout;
+          import android.widget.ImageView;
+          import android.widget.TextView;
+
+          import java.util.ArrayList;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Set;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          /** Scherm met alle apps. Hier maak je apps favoriet, verplaats je ze of verberg je ze. */
+          public class AllAppsActivity extends Activity {
+
+              private final ExecutorService io = Executors.newFixedThreadPool(2);
+
+              private GridLayout grid;
+              private TextView focusLabel;
+              private List<AppStore.AppEntry> apps = new ArrayList<>();
+              private String signature = "";
+              private String focusedPkg;
+              private int loadGeneration = 0;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setContentView(R.layout.activity_all_apps);
+                  grid = findViewById(R.id.grid);
+                  focusLabel = findViewById(R.id.focus_label);
+                  Ui.applyBackground(this, (ImageView) findViewById(R.id.background), io);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  load(false);
+              }
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  io.shutdownNow();
+              }
+
+              @Override
+              public boolean onKeyDown(int keyCode, KeyEvent event) {
+                  if (keyCode == KeyEvent.KEYCODE_MENU) {
+                      AppStore.AppEntry e = find(focusedPkg);
+                      if (e != null) {
+                          showMenu(e);
+                          return true;
+                      }
+                  }
+                  return super.onKeyDown(keyCode, event);
+              }
+
+              private void load(final boolean force) {
+                  final int gen = ++loadGeneration;
+                  io.execute(() -> {
+                      final List<AppStore.AppEntry> list = AppStore.queryAll(this);
+                      final Set<String> favs = new HashSet<>(
+                              AppStore.getList(AppStore.prefs(this), AppStore.PREF_FAVORITES));
+                      runOnUiThread(() -> {
+                          if (gen != loadGeneration || isDestroyed()) return;
+                          String sig = AppStore.signature(list) + favs.hashCode();
+                          if (!force && sig.equals(signature)) return;
+                          signature = sig;
+                          apps = list;
+                          render(favs);
+                      });
+                  });
+              }
+
+              private void render(Set<String> favs) {
+                  String restore = focusedPkg;
+                  grid.removeAllViews();
+                  int cols = Ui.columns(this);
+                  grid.setColumnCount(cols);
+                  int margin = Ui.dp(this, 9);
+                  int tileW = Ui.tileWidth(this, cols);
+                  int tileH = tileW * 9 / 16;
+
+                  View toFocus = null;
+                  for (final AppStore.AppEntry e : apps) {
+                      View tile = Ui.appTile(this, e, tileH, favs.contains(e.pkg), new Ui.TileListener() {
+                          @Override
+                          public void onClick() {
+                              AppStore.launch(AllAppsActivity.this, e);
+                          }
+
+                          @Override
+                          public void onLongClick() {
+                              showMenu(e);
+                          }
+
+                          @Override
+                          public void onFocus(boolean focused) {
+                              if (focused) {
+                                  focusedPkg = e.pkg;
+                                  focusLabel.setText(e.label);
+                              }
+                          }
+                      });
+                      GridLayout.LayoutParams lp = new GridLayout.LayoutParams();
+                      lp.width = tileW;
+                      lp.height = tileH;
+                      lp.setMargins(margin, margin, margin, margin);
+                      grid.addView(tile, lp);
+                      if (toFocus == null && e.pkg.equals(restore)) toFocus = tile;
+                  }
+
+                  if (apps.isEmpty()) {
+                      TextView empty = new TextView(this);
+                      empty.setText("Geen apps gevonden.");
+                      empty.setTextColor(0xB3FFFFFF);
+                      empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+                      grid.addView(empty);
+                      return;
+                  }
+                  if (toFocus == null) toFocus = grid.getChildAt(0);
+                  final View target = toFocus;
+                  target.post(target::requestFocus);
+              }
+
+              private void showMenu(final AppStore.AppEntry e) {
+                  final boolean fav = AppStore.isFavorite(this, e.pkg);
+                  String[] items = {
+                          fav ? "★ Uit favorieten halen" : "☆ Toevoegen aan favorieten",
+                          "Naar het begin",
+                          "Eén plek naar voren",
+                          "Eén plek naar achteren",
+                          "Verbergen",
+                          "App-info",
+                  };
+                  Ui.dialog(this, e.label).setItems(items, (d, which) -> {
+                      focusedPkg = e.pkg;
+                      switch (which) {
+                          case 0:
+                              boolean now = AppStore.toggleFavorite(this, e.pkg);
+                              Ui.toast(this, now ? e.label + " staat nu bij je favorieten"
+                                      : e.label + " is uit je favorieten gehaald");
+                              load(true);
+                              break;
+                          case 1:
+                              AppStore.move(this, AppStore.PREF_ORDER, apps, e.pkg, Integer.MIN_VALUE);
+                              load(true);
+                              break;
+                          case 2:
+                              AppStore.move(this, AppStore.PREF_ORDER, apps, e.pkg, -1);
+                              load(true);
+                              break;
+                          case 3:
+                              AppStore.move(this, AppStore.PREF_ORDER, apps, e.pkg, 1);
+                              load(true);
+                              break;
+                          case 4:
+                              AppStore.hide(this, e.pkg);
+                              focusedPkg = null;
+                              Ui.toast(this, e.label + " is verborgen. Terugzetten kan via Aanpassen.");
+                              load(true);
+                              break;
+                          case 5:
+                              Ui.tryStart(this, new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                      Uri.fromParts("package", e.pkg, null)));
+                              break;
+                          default:
+                              break;
+                      }
+                  }).show();
+              }
+
+              private AppStore.AppEntry find(String pkg) {
+                  if (pkg == null) return null;
+                  for (AppStore.AppEntry e : apps) if (e.pkg.equals(pkg)) return e;
+                  return null;
+              }
+          }
+          TVTHUIS_EOF
+          mkdir -p app/src/main/java/nl/marc/tvhome
+          cat > app/src/main/java/nl/marc/tvhome/AppStore.java <<'TVTHUIS_EOF'
+          package nl.marc.tvhome;
+
+          import android.app.Activity;
           import android.content.ComponentName;
           import android.content.Context;
           import android.content.Intent;
@@ -148,11 +353,214 @@ jobs:
           import android.content.pm.ActivityInfo;
           import android.content.pm.PackageManager;
           import android.content.pm.ResolveInfo;
-          import android.graphics.Bitmap;
-          import android.graphics.BitmapFactory;
-          import android.graphics.drawable.ColorDrawable;
           import android.graphics.drawable.Drawable;
-          import android.graphics.drawable.GradientDrawable;
+          import android.text.TextUtils;
+
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+
+          /** Apps opzoeken, favorieten, volgorde en verborgen apps. */
+          final class AppStore {
+
+              static final String PREFS = "tvthuis";
+              static final String PREF_ORDER = "order";
+              static final String PREF_HIDDEN = "hidden";
+              static final String PREF_FAVORITES = "favorites";
+
+              static final class AppEntry {
+                  String pkg;
+                  ComponentName component;
+                  boolean leanback;
+                  String label;
+                  Drawable banner;
+                  Drawable icon;
+              }
+
+              private AppStore() {}
+
+              static SharedPreferences prefs(Context c) {
+                  return c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+              }
+
+              // ------------------------------------------------------------------ opvragen
+
+              /** Alle zichtbare apps, in de volgorde die de gebruiker heeft gekozen (rest op alfabet). */
+              static List<AppEntry> queryAll(Context c) {
+                  PackageManager pm = c.getPackageManager();
+                  LinkedHashMap<String, AppEntry> map = new LinkedHashMap<>();
+                  addApps(c, pm, Intent.CATEGORY_LEANBACK_LAUNCHER, true, map);
+                  addApps(c, pm, Intent.CATEGORY_LAUNCHER, false, map);
+
+                  SharedPreferences p = prefs(c);
+                  Set<String> hidden = new HashSet<>(getList(p, PREF_HIDDEN));
+                  List<AppEntry> result = new ArrayList<>();
+                  for (String pkg : getList(p, PREF_ORDER)) {
+                      AppEntry e = map.remove(pkg);
+                      if (e != null && !hidden.contains(pkg)) result.add(e);
+                  }
+                  List<AppEntry> rest = new ArrayList<>();
+                  for (AppEntry e : map.values()) {
+                      if (!hidden.contains(e.pkg)) rest.add(e);
+                  }
+                  Collections.sort(rest, (a, b) -> a.label.compareToIgnoreCase(b.label));
+                  result.addAll(rest);
+                  return result;
+              }
+
+              /** De favorieten, in favorietenvolgorde. Apps die niet meer bestaan vallen weg. */
+              static List<AppEntry> favorites(Context c, List<AppEntry> all) {
+                  Map<String, AppEntry> byPkg = new HashMap<>();
+                  for (AppEntry e : all) byPkg.put(e.pkg, e);
+                  List<AppEntry> result = new ArrayList<>();
+                  for (String pkg : getList(prefs(c), PREF_FAVORITES)) {
+                      AppEntry e = byPkg.get(pkg);
+                      if (e != null) result.add(e);
+                  }
+                  return result;
+              }
+
+              private static void addApps(Context c, PackageManager pm, String category, boolean leanback,
+                                          LinkedHashMap<String, AppEntry> map) {
+                  Intent i = new Intent(Intent.ACTION_MAIN).addCategory(category);
+                  List<ResolveInfo> list;
+                  try {
+                      list = pm.queryIntentActivities(i, 0);
+                  } catch (Exception ex) {
+                      return;
+                  }
+                  for (ResolveInfo ri : list) {
+                      ActivityInfo ai = ri.activityInfo;
+                      if (ai == null) continue;
+                      if (c.getPackageName().equals(ai.packageName) || map.containsKey(ai.packageName)) continue;
+
+                      AppEntry e = new AppEntry();
+                      e.pkg = ai.packageName;
+                      e.component = new ComponentName(ai.packageName, ai.name);
+                      e.leanback = leanback;
+                      CharSequence label = ri.loadLabel(pm);
+                      e.label = label == null ? ai.packageName : label.toString();
+                      try {
+                          e.banner = ai.loadBanner(pm);
+                      } catch (Exception ignored) {
+                      }
+                      if (e.banner == null) {
+                          try {
+                              e.banner = pm.getApplicationBanner(ai.packageName);
+                          } catch (Exception ignored) {
+                          }
+                      }
+                      try {
+                          e.icon = ri.loadIcon(pm);
+                      } catch (Exception ignored) {
+                      }
+                      map.put(e.pkg, e);
+                  }
+              }
+
+              static String signature(List<AppEntry> list) {
+                  StringBuilder sb = new StringBuilder();
+                  for (AppEntry e : list) {
+                      sb.append(e.component.flattenToString()).append('|').append(e.label).append(';');
+                  }
+                  return sb.toString();
+              }
+
+              // ------------------------------------------------------------------ favorieten
+
+              static boolean isFavorite(Context c, String pkg) {
+                  return getList(prefs(c), PREF_FAVORITES).contains(pkg);
+              }
+
+              /** @return true als de app nu favoriet is. */
+              static boolean toggleFavorite(Context c, String pkg) {
+                  SharedPreferences p = prefs(c);
+                  List<String> favs = getList(p, PREF_FAVORITES);
+                  boolean nowFavorite;
+                  if (favs.remove(pkg)) {
+                      nowFavorite = false;
+                  } else {
+                      favs.add(pkg);
+                      nowFavorite = true;
+                  }
+                  putList(p, PREF_FAVORITES, favs);
+                  return nowFavorite;
+              }
+
+              /**
+               * Verplaatst een app binnen een lijst (favorieten of de volgorde van alle apps).
+               * delta = Integer.MIN_VALUE betekent: naar het begin.
+               */
+              static void move(Context c, String key, List<AppEntry> current, String pkg, int delta) {
+                  List<String> order = new ArrayList<>();
+                  for (AppEntry a : current) order.add(a.pkg);
+                  int idx = order.indexOf(pkg);
+                  if (idx < 0) return;
+                  int target = delta == Integer.MIN_VALUE
+                          ? 0
+                          : Math.max(0, Math.min(order.size() - 1, idx + delta));
+                  order.remove(idx);
+                  order.add(target, pkg);
+                  putList(prefs(c), key, order);
+              }
+
+              static void hide(Context c, String pkg) {
+                  SharedPreferences p = prefs(c);
+                  List<String> hidden = getList(p, PREF_HIDDEN);
+                  if (!hidden.contains(pkg)) hidden.add(pkg);
+                  putList(p, PREF_HIDDEN, hidden);
+                  List<String> favs = getList(p, PREF_FAVORITES);
+                  if (favs.remove(pkg)) putList(p, PREF_FAVORITES, favs);
+              }
+
+              // ------------------------------------------------------------------ starten
+
+              static void launch(Activity a, AppEntry e) {
+                  Intent i = new Intent(Intent.ACTION_MAIN);
+                  i.addCategory(e.leanback ? Intent.CATEGORY_LEANBACK_LAUNCHER : Intent.CATEGORY_LAUNCHER);
+                  i.setComponent(e.component);
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                  if (Ui.tryStart(a, i)) return;
+
+                  PackageManager pm = a.getPackageManager();
+                  Intent fallback = pm.getLeanbackLaunchIntentForPackage(e.pkg);
+                  if (fallback == null) fallback = pm.getLaunchIntentForPackage(e.pkg);
+                  if (fallback == null || !Ui.tryStart(a, fallback)) {
+                      Ui.toast(a, e.label + " kon niet worden gestart");
+                  }
+              }
+
+              // ------------------------------------------------------------------ lijsten in prefs
+
+              static List<String> getList(SharedPreferences p, String key) {
+                  String raw = p.getString(key, "");
+                  List<String> out = new ArrayList<>();
+                  for (String s : raw.split(",")) {
+                      if (!s.trim().isEmpty()) out.add(s.trim());
+                  }
+                  return out;
+              }
+
+              static void putList(SharedPreferences p, String key, List<String> list) {
+                  p.edit().putString(key, TextUtils.join(",", list)).apply();
+              }
+          }
+          TVTHUIS_EOF
+          mkdir -p app/src/main/java/nl/marc/tvhome
+          cat > app/src/main/java/nl/marc/tvhome/MainActivity.java <<'TVTHUIS_EOF'
+          package nl.marc.tvhome;
+
+          import android.app.Activity;
+          import android.content.ActivityNotFoundException;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.BitmapFactory;
           import android.media.tv.TvContract;
           import android.media.tv.TvInputInfo;
           import android.media.tv.TvInputManager;
@@ -164,19 +572,14 @@ jobs:
           import android.provider.Settings;
           import android.text.InputType;
           import android.text.TextUtils;
-          import android.util.TypedValue;
-          import android.view.Gravity;
           import android.view.KeyEvent;
           import android.view.View;
-          import android.view.ViewGroup;
           import android.widget.EditText;
           import android.widget.FrameLayout;
           import android.widget.GridLayout;
           import android.widget.ImageView;
-          import android.widget.LinearLayout;
           import android.widget.ScrollView;
           import android.widget.TextView;
-          import android.widget.Toast;
 
           import java.io.File;
           import java.io.FileOutputStream;
@@ -187,26 +590,18 @@ jobs:
           import java.net.URL;
           import java.util.ArrayList;
           import java.util.Arrays;
-          import java.util.Collections;
-          import java.util.HashSet;
-          import java.util.LinkedHashMap;
           import java.util.List;
           import java.util.Locale;
-          import java.util.Set;
           import java.util.concurrent.ExecutorService;
           import java.util.concurrent.Executors;
 
+          /** Het home-scherm: klok, weer, knoppen en je favoriete apps. */
           public class MainActivity extends Activity {
 
               private static final int REQ_PICK_IMAGE = 42;
               private static final long WEATHER_REFRESH_MS = 30L * 60L * 1000L;
               private static final long MAX_IMAGE_BYTES = 25L * 1024L * 1024L;
-
               private static final String PREF_CITY = "city";
-              private static final String PREF_BG = "bg_mode";
-              private static final String PREF_COLUMNS = "columns";
-              private static final String PREF_ORDER = "order";
-              private static final String PREF_HIDDEN = "hidden";
 
               private final ExecutorService io = Executors.newFixedThreadPool(2);
               private final Handler main = new Handler(Looper.getMainLooper());
@@ -216,11 +611,12 @@ jobs:
               private TextView weatherMain;
               private TextView weatherSub;
               private TextView focusLabel;
+              private TextView emptyHint;
               private ScrollView scroll;
               private GridLayout grid;
 
-              private List<AppEntry> apps = new ArrayList<>();
-              private String appsSignature = "";
+              private List<AppStore.AppEntry> favorites = new ArrayList<>();
+              private String favSignature = null;
               private String focusedPkg;
               private int loadGeneration = 0;
               private volatile long lastWeatherMs = 0;
@@ -233,42 +629,35 @@ jobs:
                   }
               };
 
-              static final class AppEntry {
-                  String pkg;
-                  ComponentName component;
-                  boolean leanback;
-                  String label;
-                  Drawable banner;
-                  Drawable icon;
-              }
-
               // ------------------------------------------------------------------ levenscyclus
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
                   setContentView(R.layout.activity_main);
-                  prefs = getSharedPreferences("tvthuis", MODE_PRIVATE);
+                  prefs = AppStore.prefs(this);
 
                   background = findViewById(R.id.background);
                   weatherMain = findViewById(R.id.weather_main);
                   weatherSub = findViewById(R.id.weather_sub);
                   focusLabel = findViewById(R.id.focus_label);
+                  emptyHint = findViewById(R.id.empty_hint);
                   scroll = findViewById(R.id.scroll);
                   grid = findViewById(R.id.grid);
 
+                  setupButton(R.id.btn_all_apps, v -> openAllApps());
                   setupButton(R.id.btn_inputs, v -> showInputs());
                   setupButton(R.id.btn_settings, v -> openSystemSettings());
                   setupButton(R.id.btn_customize, v -> showCustomizeMenu());
 
-                  applyBackground();
+                  Ui.applyBackground(this, background, io);
               }
 
               @Override
               protected void onResume() {
                   super.onResume();
-                  loadApps(false);
-                  if (SystemClock.elapsedRealtime() - lastWeatherMs > WEATHER_REFRESH_MS / 2 || lastWeatherMs == 0) {
+                  loadFavorites(false);
+                  if (lastWeatherMs == 0 || SystemClock.elapsedRealtime() - lastWeatherMs > WEATHER_REFRESH_MS / 2) {
                       refreshWeather();
                   }
                   main.removeCallbacks(weatherTick);
@@ -305,10 +694,10 @@ jobs:
               @Override
               public boolean onKeyDown(int keyCode, KeyEvent event) {
                   if (keyCode == KeyEvent.KEYCODE_MENU) {
-                      AppEntry e = findApp(focusedPkg);
+                      AppStore.AppEntry e = findFavorite(focusedPkg);
                       View f = getCurrentFocus();
                       if (e != null && f != null && f.getParent() == grid) {
-                          showAppMenu(e);
+                          showFavoriteMenu(e);
                           return true;
                       }
                   }
@@ -320,12 +709,16 @@ jobs:
               private void setupButton(int id, View.OnClickListener l) {
                   View b = findViewById(id);
                   b.setOnClickListener(l);
-                  b.setOnFocusChangeListener((v, has) -> animateFocus(v, has, 1.06f));
+                  b.setOnFocusChangeListener((v, has) -> Ui.animateFocus(v, has, 1.06f));
+              }
+
+              private void openAllApps() {
+                  startActivity(new Intent(this, AllAppsActivity.class));
               }
 
               private void openSystemSettings() {
-                  if (!tryStart(new Intent(Settings.ACTION_SETTINGS))) {
-                      toast("Instellingen konden niet worden geopend");
+                  if (!Ui.tryStart(this, new Intent(Settings.ACTION_SETTINGS))) {
+                      Ui.toast(this, "Instellingen konden niet worden geopend");
                   }
               }
 
@@ -357,15 +750,15 @@ jobs:
                   }
                   labels.add("Systeemmenu ingangen…");
 
-                  dialog("Ingang kiezen")
+                  Ui.dialog(this, "Ingang kiezen")
                           .setItems(labels.toArray(new String[0]), (d, which) -> {
                               if (which >= inputs.size()) {
                                   openSystemInputs();
                                   return;
                               }
                               Uri uri = TvContract.buildChannelUriForPassthroughInput(inputs.get(which).getId());
-                              if (!tryStart(new Intent(Intent.ACTION_VIEW, uri))) {
-                                  toast("Deze ingang kon niet worden geopend");
+                              if (!Ui.tryStart(this, new Intent(Intent.ACTION_VIEW, uri))) {
+                                  Ui.toast(this, "Deze ingang kon niet worden geopend");
                               }
                           })
                           .show();
@@ -377,256 +770,141 @@ jobs:
                           "android.settings.INPUT_SETTINGS",
                   };
                   for (String a : actions) {
-                      if (tryStart(new Intent(a))) return;
+                      if (Ui.tryStart(this, new Intent(a))) return;
                   }
-                  toast("Geen ingangenmenu gevonden. Gebruik de ingangsknop op je afstandsbediening.");
+                  Ui.toast(this, "Geen ingangenmenu gevonden. Gebruik de ingangsknop op je afstandsbediening.");
               }
 
-              // ------------------------------------------------------------------ apps
+              // ------------------------------------------------------------------ favorieten
 
-              private void loadApps(final boolean force) {
+              private void loadFavorites(final boolean force) {
                   final int gen = ++loadGeneration;
                   io.execute(() -> {
-                      final List<AppEntry> list = queryApps();
+                      final List<AppStore.AppEntry> favs = AppStore.favorites(this, AppStore.queryAll(this));
                       runOnUiThread(() -> {
                           if (gen != loadGeneration || isDestroyed()) return;
-                          String sig = signature(list);
-                          if (!force && sig.equals(appsSignature)) return;
-                          appsSignature = sig;
-                          apps = list;
-                          renderGrid();
+                          String sig = AppStore.signature(favs);
+                          if (!force && sig.equals(favSignature)) return;
+                          favSignature = sig;
+                          favorites = favs;
+                          renderFavorites();
                       });
                   });
               }
 
-              private List<AppEntry> queryApps() {
-                  PackageManager pm = getPackageManager();
-                  LinkedHashMap<String, AppEntry> map = new LinkedHashMap<>();
-                  addApps(pm, Intent.CATEGORY_LEANBACK_LAUNCHER, true, map);
-                  addApps(pm, Intent.CATEGORY_LAUNCHER, false, map);
-
-                  Set<String> hidden = new HashSet<>(getList(PREF_HIDDEN));
-                  List<AppEntry> result = new ArrayList<>();
-                  for (String pkg : getList(PREF_ORDER)) {
-                      AppEntry e = map.remove(pkg);
-                      if (e != null && !hidden.contains(pkg)) result.add(e);
-                  }
-                  List<AppEntry> rest = new ArrayList<>();
-                  for (AppEntry e : map.values()) {
-                      if (!hidden.contains(e.pkg)) rest.add(e);
-                  }
-                  Collections.sort(rest, (a, b) -> a.label.compareToIgnoreCase(b.label));
-                  result.addAll(rest);
-                  return result;
-              }
-
-              private void addApps(PackageManager pm, String category, boolean leanback,
-                                   LinkedHashMap<String, AppEntry> map) {
-                  Intent i = new Intent(Intent.ACTION_MAIN).addCategory(category);
-                  List<ResolveInfo> list;
-                  try {
-                      list = pm.queryIntentActivities(i, 0);
-                  } catch (Exception ex) {
-                      return;
-                  }
-                  for (ResolveInfo ri : list) {
-                      ActivityInfo ai = ri.activityInfo;
-                      if (ai == null) continue;
-                      if (getPackageName().equals(ai.packageName) || map.containsKey(ai.packageName)) continue;
-
-                      AppEntry e = new AppEntry();
-                      e.pkg = ai.packageName;
-                      e.component = new ComponentName(ai.packageName, ai.name);
-                      e.leanback = leanback;
-                      CharSequence label = ri.loadLabel(pm);
-                      e.label = label == null ? ai.packageName : label.toString();
-                      try {
-                          e.banner = ai.loadBanner(pm);
-                      } catch (Exception ignored) {
-                      }
-                      if (e.banner == null) {
-                          try {
-                              e.banner = pm.getApplicationBanner(ai.packageName);
-                          } catch (Exception ignored) {
-                          }
-                      }
-                      try {
-                          e.icon = ri.loadIcon(pm);
-                      } catch (Exception ignored) {
-                      }
-                      map.put(e.pkg, e);
-                  }
-              }
-
-              private static String signature(List<AppEntry> list) {
-                  StringBuilder sb = new StringBuilder();
-                  for (AppEntry e : list) sb.append(e.component.flattenToString()).append('|').append(e.label).append(';');
-                  return sb.toString();
-              }
-
-              private void renderGrid() {
-                  String restoreFocus = focusedPkg;
+              private void renderFavorites() {
+                  String restore = focusedPkg;
                   grid.removeAllViews();
 
-                  int cols = prefs.getInt(PREF_COLUMNS, 5);
+                  int cols = Ui.columns(this);
                   grid.setColumnCount(cols);
-
-                  int margin = dp(9);
-                  int sidePadding = 2 * dp(48);
-                  int avail = getResources().getDisplayMetrics().widthPixels - sidePadding;
-                  int tileW = avail / cols - 2 * margin;
+                  int margin = Ui.dp(this, 9);
+                  int tileW = Ui.tileWidth(this, cols);
                   int tileH = tileW * 9 / 16;
 
                   View toFocus = null;
-                  for (AppEntry e : apps) {
-                      View tile = makeTile(e, tileH);
-                      GridLayout.LayoutParams lp = new GridLayout.LayoutParams();
-                      lp.width = tileW;
-                      lp.height = tileH;
-                      lp.setMargins(margin, margin, margin, margin);
-                      grid.addView(tile, lp);
-                      if (toFocus == null && e.pkg.equals(restoreFocus)) toFocus = tile;
+                  for (final AppStore.AppEntry e : favorites) {
+                      View tile = Ui.appTile(this, e, tileH, false, new Ui.TileListener() {
+                          @Override
+                          public void onClick() {
+                              AppStore.launch(MainActivity.this, e);
+                          }
+
+                          @Override
+                          public void onLongClick() {
+                              showFavoriteMenu(e);
+                          }
+
+                          @Override
+                          public void onFocus(boolean focused) {
+                              if (focused) {
+                                  focusedPkg = e.pkg;
+                                  focusLabel.setText(e.label);
+                              } else if (e.pkg.equals(focusedPkg)) {
+                                  focusLabel.setText("");
+                              }
+                          }
+                      });
+                      addTile(tile, tileW, tileH, margin);
+                      if (toFocus == null && e.pkg.equals(restore)) toFocus = tile;
                   }
 
-                  if (apps.isEmpty()) {
-                      TextView empty = new TextView(this);
-                      empty.setText("Geen apps gevonden.");
-                      empty.setTextColor(0xB3FFFFFF);
-                      empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
-                      grid.addView(empty);
-                      findViewById(R.id.btn_settings).requestFocus();
-                      return;
-                  }
+                  // Laatste tegel: naar alle apps.
+                  View allTile = Ui.actionTile(this, R.drawable.ic_apps, "Alle apps", tileH, new Ui.TileListener() {
+                      @Override
+                      public void onClick() {
+                          openAllApps();
+                      }
+
+                      @Override
+                      public void onLongClick() {
+                          openAllApps();
+                      }
+
+                      @Override
+                      public void onFocus(boolean focused) {
+                          focusedPkg = null;
+                          focusLabel.setText(focused ? "Alle apps bekijken" : "");
+                      }
+                  });
+                  addTile(allTile, tileW, tileH, margin);
+
+                  emptyHint.setVisibility(favorites.isEmpty() ? View.VISIBLE : View.GONE);
 
                   if (toFocus == null) toFocus = grid.getChildAt(0);
                   final View target = toFocus;
                   target.post(target::requestFocus);
               }
 
-              private View makeTile(final AppEntry e, int tileH) {
-                  FrameLayout tile = new FrameLayout(this);
-                  tile.setFocusable(true);
-                  tile.setClickable(true);
-                  tile.setLongClickable(true);
-                  tile.setContentDescription(e.label);
-
-                  GradientDrawable bg = new GradientDrawable();
-                  bg.setColor(0xFF1C2029);
-                  bg.setCornerRadius(dp(10));
-                  tile.setBackground(bg);
-                  tile.setClipToOutline(true);
-                  tile.setForeground(getDrawable(R.drawable.tile_focus));
-
-                  if (e.banner != null) {
-                      ImageView iv = new ImageView(this);
-                      iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                      iv.setImageDrawable(e.banner);
-                      tile.addView(iv, new FrameLayout.LayoutParams(
-                              ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-                  } else {
-                      LinearLayout col = new LinearLayout(this);
-                      col.setOrientation(LinearLayout.VERTICAL);
-                      col.setGravity(Gravity.CENTER);
-                      col.setPadding(dp(8), dp(6), dp(8), dp(6));
-
-                      ImageView icon = new ImageView(this);
-                      icon.setImageDrawable(e.icon);
-                      int s = (int) (tileH * 0.42f);
-                      col.addView(icon, new LinearLayout.LayoutParams(s, s));
-
-                      TextView label = new TextView(this);
-                      label.setText(e.label);
-                      label.setTextColor(0xFFFFFFFF);
-                      label.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-                      label.setSingleLine(true);
-                      label.setEllipsize(TextUtils.TruncateAt.END);
-                      label.setGravity(Gravity.CENTER);
-                      LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                              ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                      lp.topMargin = dp(6);
-                      col.addView(label, lp);
-
-                      tile.addView(col, new FrameLayout.LayoutParams(
-                              ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-                  }
-
-                  tile.setOnClickListener(v -> launch(e));
-                  tile.setOnLongClickListener(v -> {
-                      showAppMenu(e);
-                      return true;
-                  });
-                  tile.setOnFocusChangeListener((v, has) -> {
-                      animateFocus(v, has, 1.08f);
-                      if (has) {
-                          focusedPkg = e.pkg;
-                          focusLabel.setText(e.label);
-                      } else if (e.pkg.equals(focusedPkg)) {
-                          focusLabel.setText("");
-                      }
-                  });
-                  return tile;
+              private void addTile(View tile, int w, int h, int margin) {
+                  GridLayout.LayoutParams lp = new GridLayout.LayoutParams();
+                  lp.width = w;
+                  lp.height = h;
+                  lp.setMargins(margin, margin, margin, margin);
+                  grid.addView(tile, lp);
               }
 
-              private void launch(AppEntry e) {
-                  Intent i = new Intent(Intent.ACTION_MAIN);
-                  i.addCategory(e.leanback ? Intent.CATEGORY_LEANBACK_LAUNCHER : Intent.CATEGORY_LAUNCHER);
-                  i.setComponent(e.component);
-                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-                  if (tryStart(i)) return;
-
-                  PackageManager pm = getPackageManager();
-                  Intent fallback = pm.getLeanbackLaunchIntentForPackage(e.pkg);
-                  if (fallback == null) fallback = pm.getLaunchIntentForPackage(e.pkg);
-                  if (fallback == null || !tryStart(fallback)) toast(e.label + " kon niet worden gestart");
-              }
-
-              private void showAppMenu(final AppEntry e) {
+              private void showFavoriteMenu(final AppStore.AppEntry e) {
                   String[] items = {
+                          "★ Uit favorieten halen",
                           "Naar het begin",
                           "Eén plek naar voren",
                           "Eén plek naar achteren",
-                          "Verbergen",
                           "App-info",
                   };
-                  dialog(e.label).setItems(items, (d, which) -> {
+                  Ui.dialog(this, e.label).setItems(items, (d, which) -> {
+                      focusedPkg = e.pkg;
                       switch (which) {
-                          case 0: moveApp(e.pkg, Integer.MIN_VALUE); break;
-                          case 1: moveApp(e.pkg, -1); break;
-                          case 2: moveApp(e.pkg, 1); break;
-                          case 3: hideApp(e); break;
+                          case 0:
+                              AppStore.toggleFavorite(this, e.pkg);
+                              focusedPkg = null;
+                              loadFavorites(true);
+                              break;
+                          case 1:
+                              AppStore.move(this, AppStore.PREF_FAVORITES, favorites, e.pkg, Integer.MIN_VALUE);
+                              loadFavorites(true);
+                              break;
+                          case 2:
+                              AppStore.move(this, AppStore.PREF_FAVORITES, favorites, e.pkg, -1);
+                              loadFavorites(true);
+                              break;
+                          case 3:
+                              AppStore.move(this, AppStore.PREF_FAVORITES, favorites, e.pkg, 1);
+                              loadFavorites(true);
+                              break;
                           case 4:
-                              tryStart(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                              Ui.tryStart(this, new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                                       Uri.fromParts("package", e.pkg, null)));
                               break;
-                          default: break;
+                          default:
+                              break;
                       }
                   }).show();
               }
 
-              private void moveApp(String pkg, int delta) {
-                  List<String> order = new ArrayList<>();
-                  for (AppEntry a : apps) order.add(a.pkg);
-                  int idx = order.indexOf(pkg);
-                  if (idx < 0) return;
-                  int target = delta == Integer.MIN_VALUE ? 0 : Math.max(0, Math.min(order.size() - 1, idx + delta));
-                  order.remove(idx);
-                  order.add(target, pkg);
-                  putList(PREF_ORDER, order);
-                  focusedPkg = pkg;
-                  loadApps(true);
-              }
-
-              private void hideApp(AppEntry e) {
-                  List<String> hidden = getList(PREF_HIDDEN);
-                  if (!hidden.contains(e.pkg)) hidden.add(e.pkg);
-                  putList(PREF_HIDDEN, hidden);
-                  toast(e.label + " is verborgen. Terugzetten kan via Aanpassen.");
-                  loadApps(true);
-              }
-
-              private AppEntry findApp(String pkg) {
+              private AppStore.AppEntry findFavorite(String pkg) {
                   if (pkg == null) return null;
-                  for (AppEntry e : apps) if (e.pkg.equals(pkg)) return e;
+                  for (AppStore.AppEntry e : favorites) if (e.pkg.equals(pkg)) return e;
                   return null;
               }
 
@@ -637,24 +915,23 @@ jobs:
                   String[] items = {
                           "Stad voor het weer: " + (city.isEmpty() ? "(niet ingesteld)" : city),
                           "Achtergrond",
-                          "Aantal apps per rij: " + prefs.getInt(PREF_COLUMNS, 5),
+                          "Aantal apps per rij: " + Ui.columns(this),
                           "Verborgen apps terugzetten",
-                          "Volgorde van apps herstellen",
+                          "Volgorde van alle apps herstellen",
                   };
-                  dialog("Aanpassen").setItems(items, (d, which) -> {
+                  Ui.dialog(this, "Aanpassen").setItems(items, (d, which) -> {
                       switch (which) {
                           case 0: askCity(); break;
                           case 1: showBackgroundMenu(); break;
                           case 2: askColumns(); break;
                           case 3:
-                              prefs.edit().remove(PREF_HIDDEN).apply();
-                              toast("Alle apps zijn weer zichtbaar");
-                              loadApps(true);
+                              prefs.edit().remove(AppStore.PREF_HIDDEN).apply();
+                              Ui.toast(this, "Alle apps zijn weer zichtbaar");
+                              loadFavorites(true);
                               break;
                           case 4:
-                              prefs.edit().remove(PREF_ORDER).apply();
-                              toast("Apps staan weer op alfabet");
-                              loadApps(true);
+                              prefs.edit().remove(AppStore.PREF_ORDER).apply();
+                              Ui.toast(this, "Alle apps staan weer op alfabet");
                               break;
                           default: break;
                       }
@@ -676,11 +953,11 @@ jobs:
               private void askColumns() {
                   final int[] options = {4, 5, 6, 7};
                   String[] labels = {"4", "5", "6", "7"};
-                  int current = Arrays.binarySearch(options, prefs.getInt(PREF_COLUMNS, 5));
-                  dialog("Aantal apps per rij").setSingleChoiceItems(labels, Math.max(current, 0), (d, which) -> {
-                      prefs.edit().putInt(PREF_COLUMNS, options[which]).apply();
+                  int current = Arrays.binarySearch(options, Ui.columns(this));
+                  Ui.dialog(this, "Aantal apps per rij").setSingleChoiceItems(labels, Math.max(current, 0), (d, which) -> {
+                      prefs.edit().putInt(Ui.PREF_COLUMNS, options[which]).apply();
                       d.dismiss();
-                      renderGrid();
+                      renderFavorites();
                   }).show();
               }
 
@@ -694,7 +971,7 @@ jobs:
                           "Afbeelding van internet (adres)",
                           "Afbeelding uit bestanden op de tv",
                   };
-                  dialog("Achtergrond").setItems(items, (d, which) -> {
+                  Ui.dialog(this, "Achtergrond").setItems(items, (d, which) -> {
                       switch (which) {
                           case 0: setBackgroundMode("gradient"); break;
                           case 1: setBackgroundMode("black"); break;
@@ -707,59 +984,8 @@ jobs:
               }
 
               private void setBackgroundMode(String mode) {
-                  prefs.edit().putString(PREF_BG, mode).apply();
-                  applyBackground();
-              }
-
-              private File backgroundFile() {
-                  return new File(getFilesDir(), "achtergrond.img");
-              }
-
-              private void applyBackground() {
-                  String mode = prefs.getString(PREF_BG, "gradient");
-                  if ("image".equals(mode) && backgroundFile().exists()) {
-                      final File f = backgroundFile();
-                      final int w = getResources().getDisplayMetrics().widthPixels;
-                      final int h = getResources().getDisplayMetrics().heightPixels;
-                      io.execute(() -> {
-                          final Bitmap bmp = decodeSampled(f, w, h);
-                          runOnUiThread(() -> {
-                              if (isDestroyed()) return;
-                              if (bmp != null) {
-                                  background.setImageBitmap(bmp);
-                              } else {
-                                  toast("Afbeelding kon niet worden gelezen");
-                                  background.setImageDrawable(presetDrawable("gradient"));
-                              }
-                          });
-                      });
-                      return;
-                  }
-                  background.setImageDrawable(presetDrawable(mode));
-              }
-
-              private static Drawable presetDrawable(String mode) {
-                  if ("black".equals(mode)) return new ColorDrawable(0xFF000000);
-                  int[] colors = "navy".equals(mode)
-                          ? new int[]{0xFF12264A, 0xFF050A16, 0xFF020308}
-                          : new int[]{0xFF1E2430, 0xFF0C0F15, 0xFF050608};
-                  return new GradientDrawable(GradientDrawable.Orientation.TL_BR, colors);
-              }
-
-              private static Bitmap decodeSampled(File f, int reqW, int reqH) {
-                  BitmapFactory.Options o = new BitmapFactory.Options();
-                  o.inJustDecodeBounds = true;
-                  BitmapFactory.decodeFile(f.getAbsolutePath(), o);
-                  if (o.outWidth <= 0 || o.outHeight <= 0) return null;
-                  int sample = 1;
-                  while (o.outWidth / (sample * 2) >= reqW && o.outHeight / (sample * 2) >= reqH) sample *= 2;
-                  BitmapFactory.Options o2 = new BitmapFactory.Options();
-                  o2.inSampleSize = sample;
-                  try {
-                      return BitmapFactory.decodeFile(f.getAbsolutePath(), o2);
-                  } catch (OutOfMemoryError err) {
-                      return null;
-                  }
+                  prefs.edit().putString(Ui.PREF_BG, mode).apply();
+                  Ui.applyBackground(this, background, io);
               }
 
               private void askImageUrl() {
@@ -768,7 +994,7 @@ jobs:
                           value -> {
                               final String url = value.trim();
                               if (url.isEmpty()) return;
-                              toast("Afbeelding downloaden…");
+                              Ui.toast(this, "Afbeelding downloaden…");
                               io.execute(() -> {
                                   try {
                                       HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
@@ -783,7 +1009,7 @@ jobs:
                                       }
                                       runOnUiThread(() -> setBackgroundMode("image"));
                                   } catch (Exception ex) {
-                                      runOnUiThread(() -> toast("Downloaden mislukt: " + ex.getMessage()));
+                                      runOnUiThread(() -> Ui.toast(this, "Downloaden mislukt: " + ex.getMessage()));
                                   }
                               });
                           });
@@ -804,7 +1030,7 @@ jobs:
                   try {
                       startActivityForResult(get, REQ_PICK_IMAGE);
                   } catch (ActivityNotFoundException ex) {
-                      toast("Deze tv heeft geen bestandskiezer. Gebruik een afbeelding van internet.");
+                      Ui.toast(this, "Deze tv heeft geen bestandskiezer. Gebruik een afbeelding van internet.");
                   }
               }
 
@@ -822,7 +1048,7 @@ jobs:
                           saveBackground(in);
                           runOnUiThread(() -> setBackgroundMode("image"));
                       } catch (Exception ex) {
-                          runOnUiThread(() -> toast("Afbeelding laden mislukt: " + ex.getMessage()));
+                          runOnUiThread(() -> Ui.toast(this, "Afbeelding laden mislukt: " + ex.getMessage()));
                       }
                   });
               }
@@ -851,7 +1077,7 @@ jobs:
                       tmp.delete();
                       throw new IOException("Dit is geen geldige afbeelding");
                   }
-                  File dest = backgroundFile();
+                  File dest = Ui.backgroundFile(this);
                   //noinspection ResultOfMethodCallIgnored
                   dest.delete();
                   if (!tmp.renameTo(dest)) throw new IOException("Opslaan mislukt");
@@ -911,54 +1137,247 @@ jobs:
                   input.setSingleLine(true);
                   input.setSelection(input.getText().length());
                   FrameLayout box = new FrameLayout(this);
-                  box.setPadding(dp(24), dp(8), dp(24), 0);
+                  box.setPadding(Ui.dp(this, 24), Ui.dp(this, 8), Ui.dp(this, 24), 0);
                   box.addView(input);
-                  dialog(title)
+                  Ui.dialog(this, title)
                           .setView(box)
                           .setPositiveButton("Opslaan", (d, w) -> cb.onText(input.getText().toString()))
                           .setNegativeButton("Annuleren", null)
                           .show();
                   input.requestFocus();
               }
+          }
+          TVTHUIS_EOF
+          mkdir -p app/src/main/java/nl/marc/tvhome
+          cat > app/src/main/java/nl/marc/tvhome/Ui.java <<'TVTHUIS_EOF'
+          package nl.marc.tvhome;
 
-              private AlertDialog.Builder dialog(String title) {
-                  return new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                          .setTitle(title);
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.ActivityNotFoundException;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.graphics.drawable.ColorDrawable;
+          import android.graphics.drawable.Drawable;
+          import android.graphics.drawable.GradientDrawable;
+          import android.text.TextUtils;
+          import android.util.TypedValue;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.FrameLayout;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.io.File;
+          import java.util.concurrent.ExecutorService;
+
+          /** Gedeelde stukjes interface: tegels, dialogen, achtergrond. */
+          final class Ui {
+
+              static final String PREF_BG = "bg_mode";
+              static final String PREF_COLUMNS = "columns";
+
+              interface TileListener {
+                  void onClick();
+
+                  void onLongClick();
+
+                  void onFocus(boolean focused);
               }
 
-              private boolean tryStart(Intent i) {
+              private Ui() {}
+
+              // ------------------------------------------------------------------ algemeen
+
+              static int dp(Context c, int v) {
+                  return Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v,
+                          c.getResources().getDisplayMetrics()));
+              }
+
+              static void toast(Context c, String msg) {
+                  Toast.makeText(c, msg, Toast.LENGTH_LONG).show();
+              }
+
+              static boolean tryStart(Context c, Intent i) {
                   i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                   try {
-                      startActivity(i);
+                      c.startActivity(i);
                       return true;
                   } catch (ActivityNotFoundException | SecurityException ex) {
                       return false;
                   }
               }
 
-              private void animateFocus(View v, boolean focused, float scale) {
+              static AlertDialog.Builder dialog(Context c, String title) {
+                  return new AlertDialog.Builder(c, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                          .setTitle(title);
+              }
+
+              static void animateFocus(View v, boolean focused, float scale) {
                   float s = focused ? scale : 1f;
-                  v.animate().scaleX(s).scaleY(s).translationZ(focused ? dp(8) : 0).setDuration(150).start();
+                  v.animate().scaleX(s).scaleY(s)
+                          .translationZ(focused ? dp(v.getContext(), 8) : 0)
+                          .setDuration(150).start();
               }
 
-              private List<String> getList(String key) {
-                  String raw = prefs.getString(key, "");
-                  List<String> out = new ArrayList<>();
-                  for (String s : raw.split(",")) if (!s.trim().isEmpty()) out.add(s.trim());
-                  return out;
+              // ------------------------------------------------------------------ tegels
+
+              static int columns(Context c) {
+                  return AppStore.prefs(c).getInt(PREF_COLUMNS, 5);
               }
 
-              private void putList(String key, List<String> list) {
-                  prefs.edit().putString(key, TextUtils.join(",", list)).apply();
+              /** Breedte van één tegel, uitgaande van 48dp zijmarge en 9dp marge rond elke tegel. */
+              static int tileWidth(Context c, int cols) {
+                  int avail = c.getResources().getDisplayMetrics().widthPixels - 2 * dp(c, 48);
+                  return avail / cols - 2 * dp(c, 9);
               }
 
-              private int dp(int v) {
-                  return Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v,
-                          getResources().getDisplayMetrics()));
+              static FrameLayout baseTile(Context c, String description, final TileListener l) {
+                  FrameLayout tile = new FrameLayout(c);
+                  tile.setFocusable(true);
+                  tile.setClickable(true);
+                  tile.setLongClickable(true);
+                  tile.setContentDescription(description);
+
+                  GradientDrawable bg = new GradientDrawable();
+                  bg.setColor(0xFF1C2029);
+                  bg.setCornerRadius(dp(c, 10));
+                  tile.setBackground(bg);
+                  tile.setClipToOutline(true);
+                  tile.setForeground(c.getDrawable(R.drawable.tile_focus));
+
+                  tile.setOnClickListener(v -> l.onClick());
+                  tile.setOnLongClickListener(v -> {
+                      l.onLongClick();
+                      return true;
+                  });
+                  tile.setOnFocusChangeListener((v, has) -> {
+                      animateFocus(v, has, 1.08f);
+                      l.onFocus(has);
+                  });
+                  return tile;
               }
 
-              private void toast(String msg) {
-                  Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+              static View appTile(Context c, AppStore.AppEntry e, int tileH, boolean favorite, TileListener l) {
+                  FrameLayout tile = baseTile(c, e.label, l);
+                  if (e.banner != null) {
+                      ImageView iv = new ImageView(c);
+                      iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                      iv.setImageDrawable(e.banner);
+                      tile.addView(iv, matchParent());
+                  } else {
+                      tile.addView(iconAndLabel(c, e.icon, e.label, tileH), matchParent());
+                  }
+                  if (favorite) {
+                      TextView star = new TextView(c);
+                      star.setText("★");
+                      star.setTextColor(0xFFFFD25A);
+                      star.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+                      star.setGravity(Gravity.CENTER);
+                      GradientDrawable dot = new GradientDrawable();
+                      dot.setShape(GradientDrawable.OVAL);
+                      dot.setColor(0xB3000000);
+                      star.setBackground(dot);
+                      int s = dp(c, 26);
+                      FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(s, s, Gravity.TOP | Gravity.END);
+                      lp.setMargins(0, dp(c, 6), dp(c, 6), 0);
+                      tile.addView(star, lp);
+                  }
+                  return tile;
+              }
+
+              static View actionTile(Context c, int iconRes, String label, int tileH, TileListener l) {
+                  FrameLayout tile = baseTile(c, label, l);
+                  Drawable icon = c.getDrawable(iconRes);
+                  tile.addView(iconAndLabel(c, icon, label, tileH), matchParent());
+                  return tile;
+              }
+
+              private static View iconAndLabel(Context c, Drawable icon, String text, int tileH) {
+                  LinearLayout col = new LinearLayout(c);
+                  col.setOrientation(LinearLayout.VERTICAL);
+                  col.setGravity(Gravity.CENTER);
+                  col.setPadding(dp(c, 8), dp(c, 6), dp(c, 8), dp(c, 6));
+
+                  ImageView iv = new ImageView(c);
+                  iv.setImageDrawable(icon);
+                  int s = (int) (tileH * 0.42f);
+                  col.addView(iv, new LinearLayout.LayoutParams(s, s));
+
+                  TextView label = new TextView(c);
+                  label.setText(text);
+                  label.setTextColor(0xFFFFFFFF);
+                  label.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                  label.setSingleLine(true);
+                  label.setEllipsize(TextUtils.TruncateAt.END);
+                  label.setGravity(Gravity.CENTER);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp.topMargin = dp(c, 6);
+                  col.addView(label, lp);
+                  return col;
+              }
+
+              private static FrameLayout.LayoutParams matchParent() {
+                  return new FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+              }
+
+              // ------------------------------------------------------------------ achtergrond
+
+              static File backgroundFile(Context c) {
+                  return new File(c.getFilesDir(), "achtergrond.img");
+              }
+
+              static void applyBackground(final Activity a, final ImageView target, ExecutorService io) {
+                  String mode = AppStore.prefs(a).getString(PREF_BG, "gradient");
+                  if ("image".equals(mode) && backgroundFile(a).exists()) {
+                      final File f = backgroundFile(a);
+                      final int w = a.getResources().getDisplayMetrics().widthPixels;
+                      final int h = a.getResources().getDisplayMetrics().heightPixels;
+                      io.execute(() -> {
+                          final Bitmap bmp = decodeSampled(f, w, h);
+                          a.runOnUiThread(() -> {
+                              if (a.isDestroyed()) return;
+                              if (bmp != null) {
+                                  target.setImageBitmap(bmp);
+                              } else {
+                                  target.setImageDrawable(presetDrawable("gradient"));
+                              }
+                          });
+                      });
+                      return;
+                  }
+                  target.setImageDrawable(presetDrawable(mode));
+              }
+
+              static Drawable presetDrawable(String mode) {
+                  if ("black".equals(mode)) return new ColorDrawable(0xFF000000);
+                  int[] colors = "navy".equals(mode)
+                          ? new int[]{0xFF12264A, 0xFF050A16, 0xFF020308}
+                          : new int[]{0xFF1E2430, 0xFF0C0F15, 0xFF050608};
+                  return new GradientDrawable(GradientDrawable.Orientation.TL_BR, colors);
+              }
+
+              static Bitmap decodeSampled(File f, int reqW, int reqH) {
+                  BitmapFactory.Options o = new BitmapFactory.Options();
+                  o.inJustDecodeBounds = true;
+                  BitmapFactory.decodeFile(f.getAbsolutePath(), o);
+                  if (o.outWidth <= 0 || o.outHeight <= 0) return null;
+                  int sample = 1;
+                  while (o.outWidth / (sample * 2) >= reqW && o.outHeight / (sample * 2) >= reqH) sample *= 2;
+                  BitmapFactory.Options o2 = new BitmapFactory.Options();
+                  o2.inSampleSize = sample;
+                  try {
+                      return BitmapFactory.decodeFile(f.getAbsolutePath(), o2);
+                  } catch (OutOfMemoryError err) {
+                      return null;
+                  }
               }
           }
           TVTHUIS_EOF
@@ -1091,6 +1510,10 @@ jobs:
               <string name="settings">Instellingen</string>
               <string name="customize">Aanpassen</string>
               <string name="apps">Apps</string>
+              <string name="all_apps">Alle apps</string>
+              <string name="favorites">Favorieten</string>
+              <string name="favorites_hint">Nog geen favorieten. Open Alle apps, houd OK ingedrukt op een app en kies Toevoegen aan favorieten.</string>
+              <string name="all_apps_hint">Houd OK ingedrukt voor favorieten en meer</string>
           </resources>
           TVTHUIS_EOF
           mkdir -p app/src/main/res/values
@@ -1120,6 +1543,94 @@ jobs:
                   <item name="android:clickable">true</item>
               </style>
           </resources>
+          TVTHUIS_EOF
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_all_apps.xml <<'TVTHUIS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="#FF07080C">
+
+              <ImageView
+                  android:id="@+id/background"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"
+                  android:importantForAccessibility="no"
+                  android:scaleType="centerCrop" />
+
+              <View
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"
+                  android:background="#CC000000" />
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"
+                  android:orientation="vertical"
+                  android:paddingStart="48dp"
+                  android:paddingTop="27dp"
+                  android:paddingEnd="48dp"
+                  android:paddingBottom="12dp">
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:baselineAligned="true"
+                      android:orientation="horizontal">
+
+                      <TextView
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:fontFamily="sans-serif-light"
+                          android:text="@string/all_apps"
+                          android:textColor="#FFFFFFFF"
+                          android:textSize="34sp" />
+
+                      <TextView
+                          android:id="@+id/focus_label"
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_marginStart="20dp"
+                          android:layout_weight="1"
+                          android:ellipsize="end"
+                          android:maxLines="1"
+                          android:textColor="#99FFFFFF"
+                          android:textSize="18sp" />
+
+                      <TextView
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="@string/all_apps_hint"
+                          android:textColor="#80FFFFFF"
+                          android:textSize="14sp" />
+                  </LinearLayout>
+
+                  <ScrollView
+                      android:id="@+id/scroll"
+                      android:layout_width="match_parent"
+                      android:layout_height="0dp"
+                      android:layout_marginTop="10dp"
+                      android:layout_weight="1"
+                      android:clipChildren="true"
+                      android:clipToPadding="true"
+                      android:fadingEdgeLength="32dp"
+                      android:requiresFadingEdge="vertical"
+                      android:scrollbars="none">
+
+                      <GridLayout
+                          android:id="@+id/grid"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:clipChildren="false"
+                          android:clipToPadding="false"
+                          android:columnCount="5"
+                          android:paddingTop="6dp"
+                          android:paddingBottom="24dp"
+                          android:useDefaultMargins="false" />
+                  </ScrollView>
+              </LinearLayout>
+          </FrameLayout>
           TVTHUIS_EOF
           mkdir -p app/src/main/res/layout
           cat > app/src/main/res/layout/activity_main.xml <<'TVTHUIS_EOF'
@@ -1219,6 +1730,12 @@ jobs:
                       android:orientation="horizontal">
 
                       <TextView
+                          android:id="@+id/btn_all_apps"
+                          style="@style/ActionButton"
+                          android:drawableStart="@drawable/ic_apps"
+                          android:text="@string/all_apps" />
+
+                      <TextView
                           android:id="@+id/btn_inputs"
                           style="@style/ActionButton"
                           android:drawableStart="@drawable/ic_input"
@@ -1248,7 +1765,7 @@ jobs:
                       <TextView
                           android:layout_width="wrap_content"
                           android:layout_height="wrap_content"
-                          android:text="@string/apps"
+                          android:text="@string/favorites"
                           android:textColor="#FFFFFFFF"
                           android:textSize="20sp"
                           android:textStyle="bold" />
@@ -1265,15 +1782,26 @@ jobs:
                           android:textSize="16sp" />
                   </LinearLayout>
 
+                  <TextView
+                      android:id="@+id/empty_hint"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="6dp"
+                      android:text="@string/favorites_hint"
+                      android:textColor="#99FFFFFF"
+                      android:textSize="15sp"
+                      android:visibility="gone" />
+
+                  <!-- clipChildren/clipToPadding staan aan: tegels mogen nooit over de bovenbalk schuiven -->
                   <ScrollView
                       android:id="@+id/scroll"
                       android:layout_width="match_parent"
                       android:layout_height="0dp"
                       android:layout_marginTop="4dp"
                       android:layout_weight="1"
-                      android:clipChildren="false"
-                      android:clipToPadding="false"
-                      android:fadingEdgeLength="24dp"
+                      android:clipChildren="true"
+                      android:clipToPadding="true"
+                      android:fadingEdgeLength="32dp"
                       android:requiresFadingEdge="vertical"
                       android:scrollbars="none">
 
@@ -1290,6 +1818,82 @@ jobs:
                   </ScrollView>
               </LinearLayout>
           </FrameLayout>
+          TVTHUIS_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/banner.xml <<'TVTHUIS_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="320dp" android:height="180dp"
+              android:viewportWidth="320" android:viewportHeight="180">
+              <path android:fillColor="#FF151922" android:pathData="M0,0h320v180h-320z" />
+              <group android:translateX="124" android:translateY="50" android:scaleX="3" android:scaleY="3">
+                  <path android:fillColor="#FFFFFFFF" android:pathData="M10,20v-6h4v6h5v-8h3L12,3 2,12h3v8z" />
+              </group>
+          </vector>
+          TVTHUIS_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/button_bg.xml <<'TVTHUIS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <selector xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:state_focused="true">
+                  <shape android:shape="rectangle">
+                      <corners android:radius="24dp" />
+                      <solid android:color="#FFFFFFFF" />
+                  </shape>
+              </item>
+              <item>
+                  <shape android:shape="rectangle">
+                      <corners android:radius="24dp" />
+                      <solid android:color="#26FFFFFF" />
+                  </shape>
+              </item>
+          </selector>
+          TVTHUIS_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_apps.xml <<'TVTHUIS_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="22dp" android:height="22dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF"
+                  android:pathData="M4,8h4V4H4v4zM10,20h4v-4h-4v4zM4,20h4v-4H4v4zM4,14h4v-4H4v4zM10,14h4v-4h-4v4zM16,4v4h4V4h-4zM10,8h4V4h-4v4zM16,14h4v-4h-4v4zM16,20h4v-4h-4v4z" />
+          </vector>
+          TVTHUIS_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_input.xml <<'TVTHUIS_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="22dp" android:height="22dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF"
+                  android:pathData="M21,3.01H3c-1.1,0 -2,0.9 -2,2V9h2V4.99h18v14.03H3V15H1v4.01c0,1.1 0.9,1.98 2,1.98h18c1.1,0 2,-0.88 2,-1.98v-14c0,-1.11 -0.9,-2 -2,-2zM11,16l4,-4 -4,-4v3H1v2h10v3z" />
+          </vector>
+          TVTHUIS_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'TVTHUIS_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#FF151922" android:pathData="M0,0h108v108h-108z" />
+              <group android:translateX="30" android:translateY="28" android:scaleX="2" android:scaleY="2">
+                  <path android:fillColor="#FFFFFFFF" android:pathData="M10,20v-6h4v6h5v-8h3L12,3 2,12h3v8z" />
+              </group>
+          </vector>
+          TVTHUIS_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_settings.xml <<'TVTHUIS_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="22dp" android:height="22dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF"
+                  android:pathData="M19.14,12.94c0.04,-0.3 0.06,-0.61 0.06,-0.94c0,-0.32 -0.02,-0.64 -0.07,-0.94l2.03,-1.58c0.18,-0.14 0.23,-0.41 0.12,-0.61l-1.92,-3.32c-0.12,-0.22 -0.37,-0.29 -0.59,-0.22l-2.39,0.96c-0.5,-0.38 -1.03,-0.7 -1.62,-0.94L14.4,2.81c-0.04,-0.24 -0.24,-0.41 -0.48,-0.41h-3.84c-0.24,0 -0.43,0.17 -0.47,0.41L9.25,5.35C8.66,5.59 8.12,5.92 7.63,6.29L5.24,5.33c-0.22,-0.08 -0.47,0 -0.59,0.22L2.74,8.87C2.62,9.08 2.66,9.34 2.86,9.48l2.03,1.58C4.84,11.36 4.8,11.69 4.8,12s0.02,0.64 0.07,0.94l-2.03,1.58c-0.18,0.14 -0.23,0.41 -0.12,0.61l1.92,3.32c0.12,0.22 0.37,0.29 0.59,0.22l2.39,-0.96c0.5,0.38 1.03,0.7 1.62,0.94l0.36,2.54c0.05,0.24 0.24,0.41 0.48,0.41h3.84c0.24,0 0.44,-0.17 0.47,-0.41l0.36,-2.54c0.59,-0.24 1.13,-0.56 1.62,-0.94l2.39,0.96c0.22,0.08 0.47,0 0.59,-0.22l1.92,-3.32c0.12,-0.22 0.07,-0.47 -0.12,-0.61L19.14,12.94zM12,15.6c-1.98,0 -3.6,-1.62 -3.6,-3.6s1.62,-3.6 3.6,-3.6s3.6,1.62 3.6,3.6S13.98,15.6 12,15.6z" />
+          </vector>
+          TVTHUIS_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_tune.xml <<'TVTHUIS_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="22dp" android:height="22dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF"
+                  android:pathData="M3,17v2h6v-2H3zM3,5v2h10V5H3zM13,21v-2h8v-2h-8v-2h-2v6h2zM7,9v2H3v2h4v2h2V9H7zM21,13v-2H11v2h10zM15,9h2V7h4V5h-4V3h-2v6z" />
+          </vector>
           TVTHUIS_EOF
           mkdir -p app/src/main/res/drawable
           cat > app/src/main/res/drawable/scrim.xml <<'TVTHUIS_EOF'
@@ -1320,73 +1924,6 @@ jobs:
               </item>
           </selector>
           TVTHUIS_EOF
-          mkdir -p app/src/main/res/drawable
-          cat > app/src/main/res/drawable/button_bg.xml <<'TVTHUIS_EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <selector xmlns:android="http://schemas.android.com/apk/res/android">
-              <item android:state_focused="true">
-                  <shape android:shape="rectangle">
-                      <corners android:radius="24dp" />
-                      <solid android:color="#FFFFFFFF" />
-                  </shape>
-              </item>
-              <item>
-                  <shape android:shape="rectangle">
-                      <corners android:radius="24dp" />
-                      <solid android:color="#26FFFFFF" />
-                  </shape>
-              </item>
-          </selector>
-          TVTHUIS_EOF
-          mkdir -p app/src/main/res/drawable
-          cat > app/src/main/res/drawable/ic_launcher.xml <<'TVTHUIS_EOF'
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="108dp" android:height="108dp"
-              android:viewportWidth="108" android:viewportHeight="108">
-              <path android:fillColor="#FF151922" android:pathData="M0,0h108v108h-108z" />
-              <group android:translateX="30" android:translateY="28" android:scaleX="2" android:scaleY="2">
-                  <path android:fillColor="#FFFFFFFF" android:pathData="M10,20v-6h4v6h5v-8h3L12,3 2,12h3v8z" />
-              </group>
-          </vector>
-          TVTHUIS_EOF
-          mkdir -p app/src/main/res/drawable
-          cat > app/src/main/res/drawable/ic_settings.xml <<'TVTHUIS_EOF'
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="22dp" android:height="22dp"
-              android:viewportWidth="24" android:viewportHeight="24">
-              <path android:fillColor="#FFFFFFFF"
-                  android:pathData="M19.14,12.94c0.04,-0.3 0.06,-0.61 0.06,-0.94c0,-0.32 -0.02,-0.64 -0.07,-0.94l2.03,-1.58c0.18,-0.14 0.23,-0.41 0.12,-0.61l-1.92,-3.32c-0.12,-0.22 -0.37,-0.29 -0.59,-0.22l-2.39,0.96c-0.5,-0.38 -1.03,-0.7 -1.62,-0.94L14.4,2.81c-0.04,-0.24 -0.24,-0.41 -0.48,-0.41h-3.84c-0.24,0 -0.43,0.17 -0.47,0.41L9.25,5.35C8.66,5.59 8.12,5.92 7.63,6.29L5.24,5.33c-0.22,-0.08 -0.47,0 -0.59,0.22L2.74,8.87C2.62,9.08 2.66,9.34 2.86,9.48l2.03,1.58C4.84,11.36 4.8,11.69 4.8,12s0.02,0.64 0.07,0.94l-2.03,1.58c-0.18,0.14 -0.23,0.41 -0.12,0.61l1.92,3.32c0.12,0.22 0.37,0.29 0.59,0.22l2.39,-0.96c0.5,0.38 1.03,0.7 1.62,0.94l0.36,2.54c0.05,0.24 0.24,0.41 0.48,0.41h3.84c0.24,0 0.44,-0.17 0.47,-0.41l0.36,-2.54c0.59,-0.24 1.13,-0.56 1.62,-0.94l2.39,0.96c0.22,0.08 0.47,0 0.59,-0.22l1.92,-3.32c0.12,-0.22 0.07,-0.47 -0.12,-0.61L19.14,12.94zM12,15.6c-1.98,0 -3.6,-1.62 -3.6,-3.6s1.62,-3.6 3.6,-3.6s3.6,1.62 3.6,3.6S13.98,15.6 12,15.6z" />
-          </vector>
-          TVTHUIS_EOF
-          mkdir -p app/src/main/res/drawable
-          cat > app/src/main/res/drawable/banner.xml <<'TVTHUIS_EOF'
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="320dp" android:height="180dp"
-              android:viewportWidth="320" android:viewportHeight="180">
-              <path android:fillColor="#FF151922" android:pathData="M0,0h320v180h-320z" />
-              <group android:translateX="124" android:translateY="50" android:scaleX="3" android:scaleY="3">
-                  <path android:fillColor="#FFFFFFFF" android:pathData="M10,20v-6h4v6h5v-8h3L12,3 2,12h3v8z" />
-              </group>
-          </vector>
-          TVTHUIS_EOF
-          mkdir -p app/src/main/res/drawable
-          cat > app/src/main/res/drawable/ic_tune.xml <<'TVTHUIS_EOF'
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="22dp" android:height="22dp"
-              android:viewportWidth="24" android:viewportHeight="24">
-              <path android:fillColor="#FFFFFFFF"
-                  android:pathData="M3,17v2h6v-2H3zM3,5v2h10V5H3zM13,21v-2h8v-2h-8v-2h-2v6h2zM7,9v2H3v2h4v2h2V9H7zM21,13v-2H11v2h10zM15,9h2V7h4V5h-4V3h-2v6z" />
-          </vector>
-          TVTHUIS_EOF
-          mkdir -p app/src/main/res/drawable
-          cat > app/src/main/res/drawable/ic_input.xml <<'TVTHUIS_EOF'
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="22dp" android:height="22dp"
-              android:viewportWidth="24" android:viewportHeight="24">
-              <path android:fillColor="#FFFFFFFF"
-                  android:pathData="M21,3.01H3c-1.1,0 -2,0.9 -2,2V9h2V4.99h18v14.03H3V15H1v4.01c0,1.1 0.9,1.98 2,1.98h18c1.1,0 2,-0.88 2,-1.98v-14c0,-1.11 -0.9,-2 -2,-2zM11,16l4,-4 -4,-4v3H1v2h10v3z" />
-          </vector>
-          TVTHUIS_EOF
           mkdir -p app/src/main/res/color
           cat > app/src/main/res/color/button_text.xml <<'TVTHUIS_EOF'
           <?xml version="1.0" encoding="utf-8"?>
@@ -1395,6 +1932,7 @@ jobs:
               <item android:color="#FFFFFFFF" />
           </selector>
           TVTHUIS_EOF
+          echo 'MIIKJgIBAzCCCdAGCSqGSIb3DQEHAaCCCcEEggm9MIIJuTCCBbAGCSqGSIb3DQEHAaCCBaEEggWdMIIFmTCCBZUGCyqGSIb3DQEMCgECoIIFQDCCBTwwZgYJKoZIhvcNAQUNMFkwOAYJKoZIhvcNAQUMMCsEFI2THsundE3Q9bUUntD/2SHEwNWwAgInEAIBIDAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQUNLWjevOU+4fXyv+iaE6ewSCBNDmjFASdH/GaFpgl4DCXN81iS4aTMZ05u5kfK8Mwgq2ibDUTHGl8XfV7Ju+TzDd3wsN5oPK5PJCuXqPMFQGoR2CtYaa8jDbuY0gfcgNTFbJhJRPSCun8pJM6Y1jldvgtwM8LDCvL4qWNCyayINHnLxju/rYOO/GMJP1yxOpRjTE45MUSygy2azsF/mDM55kRSUcFoqv/iITQS7DCmZy7wWr2IdYCXwUuzT0edgQHixzGKW2HodpdrGVBDBr1Us6S13JlhUxv+oCnLBS24YlssFKyeM1/9EHiPgSVpeTQkCXAqrFiXuQGkhRJ45ZnYf+DV714cH1S6PEa/hwaWjrqzrMtQDMpolFg7YrrcuD+v/2o1vmx7+rQd4nRHCYenJ4G2eW0jRGk9FtvVqtbcNyZqaU1a4rekRFrolW3+oVEhcNhr7Mmu6AutYTlQ/uLaTV28vwBjWRL+EZOj7Fp2I5dSDFoPqVial6gP0t08+avjkxhHPMzqr/4anD8he2vMcYB5AZPbXLUjI/XaDxZkhkUq//66cXQZiClZh1cVxp7x7IzRc1uspzXHbhC4nrifW2pySg6c8vjCOzwHbweZwOCY0SFvyXVdiC+p5L9l/sDVQtw07OR1it9bjoGQEobBqBl7mFFuaBfjdV+M43N5NR1WjH3e6okoD4boyDxMZ2CqgweTWA8Q0DWps/qil46t+aEqz65gbNlExv14JlxLcgdvWbFDGLqi5X17QnabMAhia0M1a+5Gl2/8VB5GnpxvjuvIZh1A50gqnAYTKbTmqlW9VD3g4aihGm7jaf8k4TxZEvPmYIv9UcTsPP9ifmEDt2mVj3knvVTNn4yGUP1qhB397dOBVDw526t1w8E+n7lGfeX51hB+shY4CVfU6owrz5fevBBwU/Qfr+CmAZE9dcboLQqY2L0aWPzWzjHhP9tGUdr6pau5e3O2NKDvj01mFRmtw991bpHo53MDgAFWv82BewHRy2JeGaa1FI5ke2xJzXRGz0n5c8jm2CDlgMiL8WJxsm2vWZqZp1vpRV7f/SCDzqt1TTFx7LG1uVzT4uVeiZMqrm5gYNU472KZmhDw46ufjHAhNTgRXiTB3EvOba0uxPmwQrNy/Pha9qc2nzjeCaP7iGRjZ0FiXz9phewY9DaQSEPSeHEwL3P7PwgrGJXde5ijJCQvG5Q11mYlO6zp2t/h3OTDNsp9OTrOJWVRn+ej4txARxMQuMR39QC48Mv8fdZukQuF9G7+3oYZAUHKdCEGF3c4KYvU3w7X15leX4Y+MJUKWDW+1/t9xobalOmdej5tbnawGdqiwqM9hiaxlpzvPtnG9cnOiR+Kvu7InawfT7rRJyxicSmCCLNDjCV7Nhcgq3Q1KlDsgKKNZBHk3uO2GND4h0q0g6+uJIyCnVQ+oXMUqzc0TVfxXHkuR5zOl+G5K9ZYBrN7JTWur20iW+oUFhfQjIe/XJxOVAblinDX+5wHTWX2s+cPgr0AHQyZ6+dnbXMSTdOeO6DNxtfo3m++DLEe99SFJyzpjaYiA0TMAxUqUZhmNBjw0c8RjwX1u/ZcKjG9BMYonhFtLH0+qpZSyx2VjzHHxJSTaAesiMnq6xDO0bUgeT2r2PFGWY5J9Yuin5iCApNZgY5WAQCgrvKzFCMB0GCSqGSIb3DQEJFDEQHg4AdAB2AHQAaAB1AGkAczAhBgkqhkiG9w0BCRUxFAQSVGltZSAxNzkzNDAwMjgwMTk2MIIEAQYJKoZIhvcNAQcGoIID8jCCA+4CAQAwggPnBgkqhkiG9w0BBwEwZgYJKoZIhvcNAQUNMFkwOAYJKoZIhvcNAQUMMCsEFHGkWQidK5fRIhtD+JWCJrTrEvAuAgInEAIBIDAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQadtTNvKEnK43JI7gTK376ICCA3CNFfWARqT2yevVQC3NSa/ce1AB4T2z/wNNzT2f/G6MVd32BTgn/agRu6sjZxj0w5JYo4u+bjVVYgQUYHN1k+0Un1/4meEPQ08mnEMulAbAWaKdWMkm0Tf9Azag/kaGtzF6anrFHTa5iD/Yk/P2v/cnrdHG4ECC+5nK832S2kInTftdRGUAB9xp1zFu7mxexBeEMPVafhtnQT8MHtDOC6q2KhPJL0sEo6BjxCDkZcRZRCYlK8/dCcW5ObcnCngxvkOtTYNzfzRgZFjhSe8CQByVRik9EzwLNPJCglmYleYUCWzSfuhsZhQdGvlj72jbgGvDE+6haoiJTL7P547BZJonXk85Fo70mlk1IX98kn72X71g2tXAzJk38q23XO+dTowFrMiBKZ1T9zrxkO5cYy3DDb1BJFSVqTzyHppgWxqA/wBD+5hvp1VYvNDrFZXM7Qn3mm0Zc/H+JPkJpTBXxpqt+Mf2p//HcPMGQhtmNys13z5joYX/o4EQ7L2wX5itSp4mUxMJ6zK2SeXPXIzhhA6hwvt+slOYj07/ngOA6wyvmaRAO4UDwd8w/saQHFI47v2nwtPMOnEtaPi+2mN4Cf5J5b+E6GRNioCeweX+JSvEcJ6hz2n/3Ab96aI9Rn4E7CgZEu/9kgtzdyjL+WwOTtpANQU5YpKNN4H7G2yjsA1nBidfXR3fYVAkxiVToY85IxiY4HzfGluGD0xHzDuEC2LSlkYLKdeOEq8ThM9phV6EpvO5Ja1yuY/vwvsfx89rB+fS3Mt+tamSfDRavCmu/QyZ2WQK34oJOtJ+2r8/Zb+cQ4ChLDMcihL7dkWOhVzpaWDFL/lb/pjMS4LX8rSOm7/ZPsofHULP2vTOTzhsBCpwddv1LoAJSVW3ifHQ2ILz9uBHcyCm2f9E1sRd7sq8IwEe0E3ZSMY0ZFOcgH5rmPvH9SX3FaPMDvqbJGAViA+3Y3n3rHylMLXJIqZLDeHTpUTqOgVKrvwyN67gqeL3urYd4RZuk+PCDIM6EL69aET/P8WS2tn0HHOjF/IThb2VaOwddkt9Rf1V9b31kyOFVtSaB3LlByUgO39OTtyX8vTeiYT0ywf5Q3AyrGasDCROcQa5FodqJGEqGDsyWnj0SpwT80yOxmUUOMnO6RraNjDIFupsD8svSLngAXsUAiJhNhVdME0wMTANBglghkgBZQMEAgEFAAQgT/PaBJ+wA77/Im68j8UhFmHsR4H12leyfodmQxJ+MucEFAAph6pVed+ZJNOsI2srwkk7D+dbAgInEA==' | base64 -d > app/thuis.keystore
 
       - name: APK bouwen
         run: |
